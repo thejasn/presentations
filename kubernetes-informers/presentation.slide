@@ -1,0 +1,175 @@
+# Kubernetes Informers 
+23 May 2023
+
+Thejas N
+thn@redhat.com
+
+##  What is client-go?
+- A client library for interacting with the Kubernetes API server
+- Provides abstractions and methods that simplify resource lifecycle
+- Key features is its event-driven programming paradigm
+    - Provides the building blocks for writing Kubernetes controllers/operators/components
+- Building controllers with controller-runtime is pretty easy but it 
+  masks many details on how the event-oriented architecture of client-go works underneath.
+
+: Important packages in client-go tools/cache, kubernetes, dynamic, discovery 
+
+## How the event-oriented architecture works in client-go?
+
+    +--------------------------------------------------+
+    |                Kubernetes API Server             |
+    +--------------------------------------------------+
+                             |
+                             v
+    +--------------------------------------------------+
+    |                       Watcher                    |
+    |       (Resource Watcher for a specific resource) |
+    +--------------------------------------------------+
+                             |
+                             v
+    +--------------------------------------------------+
+    |                    Event Handler                 |
+    |             (Custom logic for event processing)  |
+    +--------------------------------------------------+
+                             |
+                             v
+    +--------------------------------------------------+
+    |                   Application Logic               |
+    |          (Controller, Operator, or other code)    |
+    +--------------------------------------------------+
+
+
+##  What is the watcher interface?
+    
+    // Interface can be implemented by anything that knows how to watch and report changes.
+    type Interface interface {
+        // Stop stops watching. Will close the channel returned by ResultChan(). Releases
+        // any resources used by the watch.
+        Stop()
+
+        // ResultChan returns a chan which will receive all the events. If an error occurs
+        // or Stop() is called, the implementation will close this channel and
+        // release any resources used by the watch.
+        ResultChan() <-chan Event
+    }
+
+- Fundamental low level interface which dictates _how to watch_
+- Drawbacks of using this is you end up rolling your own event type routing and indexing
+    - Too low level and error prone (since it is easy to go wrong)
+- This is where the Informer types in the `tools/cache` package come in
+
+## What are Informers?
+
+- A higher-level abstraction provided by client-go.
+- Simplifies the process of watching and handling changes to resources 
+- Built on top of lower-level watch mechanism and provide additional features
+    - Efficiency: Informers use a local cahce mechanism
+    - Resilience: Automatic reconnect and resynchronize with API Server
+    - Strong consistency guarantees (in-sync and ordered)
+- A single informer has 3 main components
+    - [Reflector](https://github.com/kubernetes/client-go/blob/2a5f18df73b70cb85c26a3785b06162f3d513cf5/tools/cache/controller.go#L94)
+    - [Queue](https://github.com/kubernetes/client-go/blob/2a5f18df73b70cb85c26a3785b06162f3d513cf5/tools/cache/controller.go#L45)
+    - [Indexer/Store](https://github.com/kubernetes/client-go/blob/2a5f18df73b70cb85c26a3785b06162f3d513cf5/tools/cache/index.go#L35)
+- Every built-in Kubernetes resource has an Informer.
+
+## What are Informers?
+
+- Below all the abstractions, an Informer is basically a low level controller 
+  which implementes the `cache.Controller` interface.
+
+```go
+    // Controller is a low-level controller that is parameterized by a
+    // Config and used in sharedIndexInformer.
+    type Controller interface {
+        // Run does two things.  One is to construct and run a Reflector
+        // to pump objects/notifications from the Config's ListerWatcher
+        // to the Config's Queue and possibly invoke the occasional Resync
+        // on that Queue.  The other is to repeatedly Pop from the Queue
+        // and process with the Config's ProcessFunc.  Both of these
+        // continue until `stopCh` is closed.
+        Run(stopCh <-chan struct{})
+
+        // HasSynced delegates to the Config's Queue
+        HasSynced() bool
+
+        // LastSyncResourceVersion delegates to the Reflector when there
+        // is one, otherwise returns the empty string
+        LastSyncResourceVersion() string
+    }
+````
+
+## What is a Reflector? 
+
+- A reflector boils down to a local cache + watcher 
+```go
+	// The destination to sync up with the watch source
+	store Store
+	// listerWatcher is used to perform lists and watches.
+	listerWatcher ListerWatcher
+```
+- The `cache.Store` interface is basically an informer's local cache
+- The `ListerWatcher` interface is a composes of generic [List and Watch functions](https://github.com/kubernetes/client-go/blob/2a5f18df73b70cb85c26a3785b06162f3d513cf5/tools/cache/listwatch.go#L43).
+- Responsible for populating and updating the informer's cache by periodically querying the API server
+
+: Initialization -> initial listing -> added to cache -> set up watches -> periodic updates (manual sync) -> handle watch events -> sync cache
+
+## What is an Indexer? 
+
+- An indexer is an optimized and efficient local cache that is used by an informer.
+- A data structure to facilitate efficient querying and filtering of resources based on some criteria.
+- Creates an index of the informer's cache, which allows for faster access to resources that match the specified indexing criteria.
+```go 
+// `*cache` implements Indexer in terms of a ThreadSafeStore and an
+// associated KeyFunc.
+type cache struct {
+	// cacheStorage bears the burden of thread safety for the cache
+	cacheStorage ThreadSafeStore
+	// keyFunc is used to make the key for objects stored in and retrieved from items, and
+	// should be deterministic.
+	keyFunc KeyFunc
+}
+```
+- Scan informer cache and builds an index based on indexing criteria.
+```go 
+// Index maps the indexed value to a set of keys in the store that match on that value
+type Index map[string]sets.String
+```
+
+: Indexing criteria (specific field, labels, namespace) -> scan informer cache and build index -> updates index to reflect informer's cache changes ->
+: -> retrieve from cache based on criteria (instead of scanning entire cache)
+
+
+## What is a DeltaFIFO? 
+
+- An informer uses a [DeltaFIFO](https://github.com/kubernetes/client-go/blob/2a5f18df73b70cb85c26a3785b06162f3d513cf5/tools/cache/delta_fifo.go#LL60C4-L60C13) 
+  to store the related resource events.
+- It is a data structure that efficiently stores and processes incremental changes (deltas) to resources.
+- DeltaFIFO is a producer-consumer queue, where a Reflector is intended to be the producer, 
+  and the consumer is whatever calls the Pop() method.
+
+
+## What are SharedInformers?
+
+- Wraps around a shared informer factory to provide a more efficient way of watching resources
+- Multiplexed resource watcher that allows multiple informers to reuse and share a single connection 
+```go
+type SharedInformer interface {
+	AddEventHandler(handler ResourceEventHandler) (ResourceEventHandlerRegistration, error)
+	AddEventHandlerWithResyncPeriod(handler ResourceEventHandler, resyncPeriod time.Duration) (ResourceEventHandlerRegistration, error)
+	RemoveEventHandler(handle ResourceEventHandlerRegistration) error
+	// GetStore returns the informer's local cache as a Store.
+	GetStore() Store
+	// GetController is deprecated, it does nothing useful
+	GetController() Controller
+	// Run starts and runs the shared informer, returning after it stops.
+	// The informer will be stopped when stopCh is closed.
+	Run(stopCh <-chan struct{})
+    ...
+}
+```
+
+## Connecting all the dots 
+
+.image informer-arch.jpg
+
+## Demo 
